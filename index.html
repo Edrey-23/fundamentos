@@ -1,0 +1,439 @@
+"""
+================================================================================
+ SISTEMA DE RECONOCIMIENTO DE FIGURAS COMO PROBLEMA DE BUSQUEDA
+ Red de rasgos + BFS + DFS + A* + Algoritmo Genetico de calibracion de pesos
+ Flujo completo: extraccion -> busqueda ponderada -> evaluacion -> aprendizaje
+================================================================================
+ Ejecutar:  python reconocimiento_figuras.py
+ Requiere:  numpy
+================================================================================
+"""
+
+import math
+import random
+import heapq
+import itertools
+import collections
+import numpy as np
+
+SEED = 7
+random.seed(SEED)
+np.random.seed(SEED)
+
+FIGURAS  = ["CIRCULO", "CUADRADO", "TRIANGULO", "TRAPECIO", "ESTRELLA", "NULL"]
+FEATURES = ["lados", "vertices", "angulo", "simetria", "convex", "compacidad", "perimetro"]
+NF = len(FEATURES)
+
+# ------------------------------------------------------------------------------
+# 1. TABLA DE PROTOTIPOS  (media, tolerancia) por figura y por rasgo
+# ------------------------------------------------------------------------------
+PROTO = {
+    "CIRCULO":   {"lados": (0, .6),  "vertices": (0, .6),  "angulo": (0, 12),    "simetria": (8, 3.5), "convex": (1, .4), "compacidad": (1.00, .07), "perimetro": (3.55, .35)},
+    "CUADRADO":  {"lados": (4, .6),  "vertices": (4, .6),  "angulo": (90, 7),    "simetria": (4, 1.2), "convex": (1, .4), "compacidad": (0.79, .07), "perimetro": (4.00, .35)},
+    "TRIANGULO": {"lados": (3, .6),  "vertices": (3, .6),  "angulo": (60, 8),    "simetria": (3, 1.2), "convex": (1, .4), "compacidad": (0.61, .08), "perimetro": (4.56, .55)},
+    "TRAPECIO":  {"lados": (4, .6),  "vertices": (4, .6),  "angulo": (76, 9),    "simetria": (1, .8),  "convex": (1, .4), "compacidad": (0.62, .09), "perimetro": (4.75, .55)},
+    "ESTRELLA":  {"lados": (10, 1.5),"vertices": (10, 1.5),"angulo": (144, 14),  "simetria": (5, 1.2), "convex": (0, .4), "compacidad": (0.30, .09), "perimetro": (6.60, .90)},
+    "NULL":      {"lados": (7, 2.0), "vertices": (7, 2.0), "angulo": (126, 26),  "simetria": (0, .6),  "convex": (1, .6), "compacidad": (0.55, .13), "perimetro": (4.90, .80)},
+}
+
+# ------------------------------------------------------------------------------
+# 2. GEOMETRIA AUXILIAR
+# ------------------------------------------------------------------------------
+def _cross2(o, a, b):
+    return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+def area(p):
+    x, y = p[:, 0], p[:, 1]
+    return 0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+
+def perim(p):
+    return float(np.linalg.norm(np.roll(p, -1, axis=0) - p, axis=1).sum())
+
+def _rdp(p, eps):
+    if len(p) < 3:
+        return p
+    a, b = p[0], p[-1]
+    ab = b - a
+    L = float(np.linalg.norm(ab))
+    if L == 0.0:
+        return np.array([a, b])
+    d = np.abs(ab[0] * (p[:, 1] - a[1]) - ab[1] * (p[:, 0] - a[0])) / L
+    i = int(np.argmax(d))
+    if d[i] > eps:
+        return np.vstack([_rdp(p[:i + 1], eps)[:-1], _rdp(p[i:], eps)])
+    return np.array([a, b])
+
+def simplify(p, eps=2.0):
+    """Aproximacion poligonal de un contorno cerrado (RDP sobre el par mas lejano)."""
+    if len(p) < 3:
+        return p
+    d = np.linalg.norm(p[:, None, :] - p[None, :, :], axis=2)
+    i, j = np.unravel_index(int(np.argmax(d)), d.shape)
+    if i > j:
+        i, j = j, i
+    c1 = p[i:j + 1]
+    c2 = np.vstack([p[j:], p[:i + 1]])
+    r1 = _rdp(c1, eps)
+    r2 = _rdp(c2, eps)
+    out = np.vstack([r1[:-1], r2[:-1]])
+    # deduplicado de vertices consecutivos
+    keep = [out[0]]
+    for q in out[1:]:
+        if np.linalg.norm(q - keep[-1]) > eps:
+            keep.append(q)
+    if len(keep) > 1 and np.linalg.norm(keep[0] - keep[-1]) <= eps:
+        keep.pop()
+    return np.array(keep)
+
+def hull(p):
+    pts = sorted(map(tuple, p))
+    if len(pts) <= 2:
+        return np.array(pts, float)
+    def half(seq):
+        h = []
+        for q in seq:
+            while len(h) >= 2 and _cross2(h[-2], h[-1], q) <= 0:
+                h.pop()
+            h.append(q)
+        return h
+    lo = half(pts)
+    up = half(pts[::-1])
+    return np.array(lo[:-1] + up[:-1], float)
+
+def angulo_medio(p):
+    n = len(p)
+    if n < 3:
+        return 0.0
+    tot = 0.0
+    for i in range(n):
+        a = p[(i - 1) % n] - p[i]
+        b = p[(i + 1) % n] - p[i]
+        na, nb = np.linalg.norm(a), np.linalg.norm(b)
+        if na < 1e-9 or nb < 1e-9:
+            continue
+        tot += math.degrees(math.acos(float(np.clip(np.dot(a, b) / (na * nb), -1, 1))))
+    return tot / n
+
+def simetrias(p):
+    """Orden de simetria rotacional; 1 si solo reflexion; 0 si ninguna."""
+    n = len(p)
+    if n < 3:
+        return 0
+    c = p.mean(axis=0)
+    rel = p - c
+    R = float(np.linalg.norm(rel, axis=1).mean()) + 1e-9
+    mejor = 0
+    for k in range(2, n + 1):
+        if n % k:
+            continue
+        th = 2 * math.pi / k
+        ok = True
+        for i in range(n):
+            x, y = rel[i]
+            rot = np.array([x * math.cos(th) - y * math.sin(th),
+                            x * math.sin(th) + y * math.cos(th)])
+            if float(np.min(np.linalg.norm(rel - rot, axis=1))) > 0.16 * R:
+                ok = False
+                break
+        if ok:
+            mejor = max(mejor, k)
+    if mejor:
+        return mejor
+    w, v = np.linalg.eigh(np.cov(rel.T))
+    ax = v[:, int(np.argmax(w))]
+    mirror = 2 * np.outer(rel @ ax, ax) - rel
+    err = float(np.max(np.min(np.linalg.norm(rel[:, None, :] - mirror[None, :, :], axis=2), axis=1)))
+    return 1 if err < 0.16 * R else 0
+
+# ------------------------------------------------------------------------------
+# 3. RED DE RASGOS  (7 detectores)
+# ------------------------------------------------------------------------------
+def extraer(p):
+    A = area(p)
+    P = perim(p)
+    comp = 4 * math.pi * A / (P * P + 1e-9)
+    pn = P / math.sqrt(A + 1e-9)
+    if comp > 0.93:                                   # circularidad -> circulo
+        return {"lados": 0.0, "vertices": 0.0, "angulo": 0.0, "simetria": 8.0,
+                "convex": 1.0, "compacidad": comp, "perimetro": pn}
+    q = simplify(p, 2.0)
+    n = len(q)
+    if n < 3:
+        return {"lados": 0.0, "vertices": 0.0, "angulo": 0.0, "simetria": 8.0,
+                "convex": 1.0, "compacidad": comp, "perimetro": pn}
+    cv = 1.0 if area(hull(q)) / (area(q) + 1e-9) > 0.97 else 0.0
+    return {"lados": float(n), "vertices": float(n), "angulo": angulo_medio(q),
+            "simetria": float(simetrias(q)), "convex": cv,
+            "compacidad": comp, "perimetro": pn}
+
+# ------------------------------------------------------------------------------
+# 4. GENERADOR DE IMAGENES SINTETICAS
+# ------------------------------------------------------------------------------
+def gen_figura(nombre, rng):
+    if nombre == "CIRCULO":
+        t = np.linspace(0, 2 * math.pi, 64, endpoint=False)
+        r = rng.uniform(25, 45)
+        p = np.c_[r * np.cos(t), r * np.sin(t)]
+    elif nombre == "CUADRADO":
+        s = rng.uniform(35, 70)
+        p = np.array([[0, 0], [s, 0], [s, s], [0, s]], float)
+    elif nombre == "TRIANGULO":
+        s = rng.uniform(45, 80)
+        p = np.array([[0, 0], [s, 0], [s / 2, s * math.sqrt(3) / 2]], float)
+    elif nombre == "TRAPECIO":
+        b = rng.uniform(60, 85)
+        t = b * rng.uniform(0.45, 0.65)
+        h = rng.uniform(35, 60)
+        p = np.array([[0, 0], [b, 0], [(b + t) / 2, h], [(b - t) / 2, h]], float)
+    elif nombre == "ESTRELLA":
+        R = rng.uniform(40, 60)
+        r = R * rng.uniform(0.38, 0.48)
+        p = np.array([[(R if i % 2 == 0 else r) * math.cos(math.pi * i / 5 - math.pi / 2),
+                       (R if i % 2 == 0 else r) * math.sin(math.pi * i / 5 - math.pi / 2)]
+                      for i in range(10)])
+    else:                                             # NULL: contorno irregular
+        k = rng.randint(6, 9)
+        R = rng.uniform(30, 50)
+        ang = np.sort(rng.uniform(0, 2 * math.pi, k))
+        rad = R * rng.uniform(0.5, 1.0, k)
+        p = np.c_[rad * np.cos(ang), rad * np.sin(ang)]
+    th = rng.uniform(0, 2 * math.pi)
+    Rm = np.array([[math.cos(th), -math.sin(th)], [math.sin(th), math.cos(th)]])
+    p = p @ Rm.T
+    p = p + rng.normal(0, 0.6, p.shape)
+    return p + np.array([100.0, 100.0]) - p.mean(axis=0)
+
+def dataset(n_por_clase, rng):
+    data = []
+    for f in FIGURAS:
+        for _ in range(n_por_clase):
+            data.append((extraer(gen_figura(f, rng)), f))
+    rng.shuffle(data)
+    return data
+
+# ------------------------------------------------------------------------------
+# 5. FILTRO DE HIPOTESIS Y PRUEBA DE OBJETIVO
+# ------------------------------------------------------------------------------
+def candidatos(vals):
+    H = []
+    for f in FIGURAS:
+        ok = True
+        for k, v in vals.items():
+            m, t = PROTO[f][k]
+            if abs(v - m) > t:
+                ok = False
+                break
+        if ok:
+            H.append(f)
+    return H
+
+def es_objetivo(vals):
+    return len(candidatos(vals)) <= 1
+
+# ------------------------------------------------------------------------------
+# 6. HEURISTICA h(s) = |D_min(H_s)|  (recubrimiento voraz de pares sin separar)
+# ------------------------------------------------------------------------------
+def h_heur(vals):
+    H = candidatos(vals)
+    if len(H) <= 1:
+        return 0
+    pares = list(itertools.combinations(H, 2))
+    rest = [f for f in FEATURES if f not in vals]
+    sep = {}
+    for f in rest:
+        sep[f] = [pr for pr in pares
+                  if abs(PROTO[pr[0]][f][0] - PROTO[pr[1]][f][0]) > PROTO[pr[0]][f][1] + PROTO[pr[1]][f][1]]
+    cubierto, n = set(), 0
+    while len(cubierto) < len(pares) and rest:
+        mejor = max(rest, key=lambda f: len([p for p in sep[f] if p not in cubierto]))
+        if not [p for p in sep[mejor] if p not in cubierto]:
+            break
+        cubierto |= set(sep[mejor])
+        rest.remove(mejor)
+        n += 1
+    return n
+
+# ------------------------------------------------------------------------------
+# 7. MOTORES DE BUSQUEDA
+# ------------------------------------------------------------------------------
+def buscar(full, modo, w=None):
+    """Devuelve (rasgos_revelados, n_comparaciones). modo: bfs | dfs | a"""
+    def coste(f):
+        return 1.0 if w is None else (2.0 - w[FEATURES.index(f)])
+
+    inicio = frozenset()
+    vals_de = {inicio: {}}
+    visitado = {inicio: 0.0}
+
+    if modo == "bfs":
+        frontera = collections.deque([inicio])
+    elif modo == "dfs":
+        frontera = [inicio]
+    else:
+        frontera = [(float(h_heur({})), 0.0, inicio)]
+
+    nodos = 0
+    while frontera:
+        nodos += 1
+        if nodos > 200000:
+            break
+        if modo in ("bfs", "dfs"):
+            s = frontera.popleft() if modo == "bfs" else frontera.pop()
+        else:
+            _, _, s = heapq.heappop(frontera)
+        v = vals_de[s]
+        if es_objetivo(v):
+            return v, len(s)
+        for f in FEATURES:
+            if f in v:
+                continue
+            nv = dict(v)
+            nv[f] = full[f]
+            ns = frozenset(nv.keys())
+            if ns in visitado and visitado[ns] <= visitado[s] + coste(f):
+                continue
+            visitado[ns] = visitado[s] + coste(f)
+            vals_de[ns] = nv
+            if modo == "bfs":
+                frontera.append(ns)
+            elif modo == "dfs":
+                frontera.append(ns)
+            else:
+                heapq.heappush(frontera, (visitado[ns] + h_heur(nv), visitado[ns], ns))
+    v = dict(full)
+    return v, len(v)
+
+def clasificar(full, modo="a", w=None):
+    v, comps = buscar(full, modo, w)
+    H = candidatos(v)
+    return (H[0] if len(H) == 1 else "NULL"), comps
+
+# ------------------------------------------------------------------------------
+# 8. ALGORITMO GENETICO  (cromosoma = vector de pesos de rasgos)
+# ------------------------------------------------------------------------------
+LAMBDA_PEN = 0.30
+P_POB, P_GEN = 16, 12
+P_CRUCE, P_MUT = 0.80, 0.10
+P_REINICIO = 0.02
+ESTANCAMIENTO = 5
+UMBRAL = 0.985
+
+def fitness(w, data):
+    aciertos = comps = 0
+    for vals, y in data:
+        pred, c = clasificar(vals, "a", w)
+        aciertos += int(pred == y)
+        comps += c
+    n = len(data)
+    return aciertos / n - LAMBDA_PEN * comps / n / NF
+
+def torneo(pob, apt, k=3):
+    idx = random.sample(range(len(pob)), k)
+    return pob[max(idx, key=lambda i: apt[i])]
+
+def blx(a, b):
+    beta = random.uniform(-0.25, 1.25)
+    return ([float(np.clip((1 - beta) * x + beta * y, 0, 1)) for x, y in zip(a, b)],
+            [float(np.clip((1 - beta) * y + beta * x, 0, 1)) for x, y in zip(a, b)])
+
+def mutar(w):
+    for i in range(len(w)):
+        if random.random() < P_MUT:
+            w[i] = float(np.clip(w[i] + random.gauss(0, 0.10), 0, 1))
+        if random.random() < P_REINICIO:
+            w[i] = random.random()
+    return w
+
+def algoritmo_genetico(data):
+    pob = [[random.random() for _ in range(NF)] for _ in range(P_POB)]
+    mejor, mejor_apt = None, -9e9
+    sin_mejora = 0
+    hist = []
+
+    for g in range(1, P_GEN + 1):
+        apt = [fitness(w, data) for w in pob]
+        i_max = int(np.argmax(apt))
+        if apt[i_max] > mejor_apt + 1e-3:
+            mejor, mejor_apt, sin_mejora = list(pob[i_max]), apt[i_max], 0
+        else:
+            sin_mejora += 1
+        hist.append((g, max(apt), mejor_apt))
+        print(f"  gen {g:02d}  apt_max={max(apt):.4f}  mejor_hist={mejor_apt:.4f}  sin_mejora={sin_mejora}")
+
+        if mejor_apt >= UMBRAL:                       # parada 1: umbral de aptitud
+            print("  -> parada: umbral de aptitud alcanzado"); break
+        if sin_mejora >= ESTANCAMIENTO:               # parada 2: estancamiento
+            print("  -> parada: estancamiento"); break
+
+        orden = sorted(range(len(pob)), key=lambda i: -apt[i])
+        nueva = [list(pob[orden[0]]), list(pob[orden[1]])]     # elitismo
+        while len(nueva) < P_POB:
+            a, b = torneo(pob, apt), torneo(pob, apt)
+            h1, h2 = blx(a, b) if random.random() < P_CRUCE else (list(a), list(b))
+            nueva.append(mutar(h1)); nueva.append(mutar(h2))
+        pob = nueva[:P_POB]
+    return mejor, mejor_apt, hist
+
+# ------------------------------------------------------------------------------
+# 9. FLUJO COMPLETO
+# ------------------------------------------------------------------------------
+def evaluar(w, data, modo="a"):
+    aciertos = comps = 0
+    matriz = collections.Counter()
+    for vals, y in data:
+        pred, c = clasificar(vals, modo, w)
+        aciertos += int(pred == y)
+        comps += c
+        matriz[(y, pred)] += 1
+    n = len(data)
+    return aciertos / n, comps / n, matriz
+
+def main():
+    rng = random.Random(SEED)
+    print("=" * 72)
+    print(" 0. RED DE RASGOS: generacion y extraccion del corpus")
+    print("=" * 72)
+    train = dataset(12, rng)
+    test = dataset(6, rng)
+    print(f"   train={len(train)}  test={len(test)}  rasgos={NF}")
+
+    w_manual = [0.90, 0.90, 0.70, 0.80, 0.50, 0.30, 0.20]
+
+    print("\n" + "=" * 72)
+    print(" A. BUSQUEDA CIEGA  (BFS / DFS)  sin informacion adicional")
+    print("=" * 72)
+    for modo in ("bfs", "dfs"):
+        acc, comps, _ = evaluar(None, test, modo)
+        print(f"   {modo.upper():3s}  aciertos={acc:.3f}  comparaciones_medias={comps:.2f}")
+
+    print("\n" + "=" * 72)
+    print(" B. BUSQUEDA HEURISTICA A*  con pesos manuales")
+    print("=" * 72)
+    acc_m, comp_m, _ = evaluar(w_manual, test, "a")
+    print(f"   A*    aciertos={acc_m:.3f}  comparaciones_medias={comp_m:.2f}")
+    print(f"   h admisible (|D_min|): h(s0) = {h_heur({})},  h({{lados=4}}) = {h_heur({'lados': 4.0})}")
+
+    print("\n" + "=" * 72)
+    print(" C. APRENDIZAJE: el AG optimiza el vector de pesos")
+    print("=" * 72)
+    w_ga, apt_ga, _ = algoritmo_genetico(train)
+    print(f"   w* = [{', '.join(f'{x:.2f}' for x in w_ga)}]   fitness={apt_ga:.4f}")
+
+    print("\n" + "=" * 72)
+    print(" D. RESULTADO FINAL sobre el conjunto de prueba")
+    print("=" * 72)
+    acc_g, comp_g, matriz = evaluar(w_ga, test, "a")
+    print(f"   A* + w*   aciertos={acc_g:.3f}  comparaciones_medias={comp_g:.2f}")
+    print(f"   Mejora en aciertos: {acc_g - acc_m:+.3f}   "
+          f"Mejora en comparaciones: {comp_m - comp_g:+.2f}")
+    print("\n   Matriz de confusion (real -> predicho):")
+    for (y, p), c in sorted(matriz.items()):
+        marca = "" if y == p else "   <-- error"
+        print(f"     {y:10s} -> {p:10s} : {c}{marca}")
+
+    print("\n   Pesos aprendidos por rasgo:")
+    for f, x in sorted(zip(FEATURES, w_ga), key=lambda t: -t[1]):
+        print(f"     {f:12s} {x:.3f}")
+
+if __name__ == "__main__":
+    main() 
